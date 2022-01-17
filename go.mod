@@ -4,7 +4,6 @@ require (
 	github.com/BurntSushi/toml v0.3.1
 	github.com/Connor1996/badger v1.5.1-0.20210202034640-5ff470f827f8
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f
-	github.com/dgraph-io/badger v1.6.0
 	github.com/docker/go-units v0.4.0
 	github.com/gogo/protobuf v1.3.1
 	github.com/golang/protobuf v1.3.4
@@ -30,7 +29,6 @@ require (
 )
 
 require (
-	github.com/AndreasBriese/bbloom v0.0.0-20190306092124-e2d15f34fcf9 // indirect
 	github.com/DataDog/zstd v1.4.1 // indirect
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

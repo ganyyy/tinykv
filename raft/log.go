@@ -14,7 +14,11 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -52,11 +56,23 @@ type RaftLog struct {
 	// Your Data Here (2A).
 }
 
+var ErrTermIndexNotfound = errors.New("request term entity not found")
+
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// Your Code Here (2A).
-	return nil
+	var lo, _ = storage.FirstIndex()
+	var hi, _ = storage.LastIndex() // 这个返回的是最后一个有效的Entity的索引
+	var hardState, _, _ = storage.InitialState()
+	var entries, _ = storage.Entries(lo, hi+1) // 注意看函数定义, 是一个左闭右开的区间
+
+	return &RaftLog{
+		storage:   storage,
+		committed: hardState.Commit,
+		applied:   lo - 1,
+		stabled:   hi,
+		entries:   entries,
+	}
 }
 
 // We need to compact the log entries in some point of time like
@@ -69,23 +85,38 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	var first, _ = l.storage.FirstIndex()
+	var start = int(l.stabled - first + 1)
+	if start < 0 {
+		return nil
+	}
+	return l.entries[start:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	if l.committed > l.applied {
+		return nil
+	}
+	var first, _ = l.storage.FirstIndex()
+	var begin, end = int(l.applied + 1 - first), int(l.committed + 1 - first)
+	if begin < 0 || end > len(l.entries) {
+		return nil
+	}
+	return l.entries[begin:end]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	var idx, _ = l.storage.LastIndex()
+	return idx
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	var term, err = l.storage.Term(i)
+	if err != nil {
+		return 0, err
+	}
+	return term, nil
 }
