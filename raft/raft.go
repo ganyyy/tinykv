@@ -224,11 +224,21 @@ func (r *Raft) sendAppendResp() {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	r.send(pb.Message{MsgType: pb.MessageType_MsgHeartbeat})
+	r.send(pb.Message{
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		MsgType: pb.MessageType_MsgHeartbeat,
+	})
 }
 
 func (r *Raft) sendHeartbeatResp(to uint64) {
-	r.send(pb.Message{MsgType: pb.MessageType_MsgHeartbeatResponse})
+	r.send(pb.Message{
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+	})
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -346,7 +356,7 @@ func (r *Raft) Step(m pb.Message) error {
 				if id == r.id {
 					continue
 				}
-				r.send(pb.Message{MsgType: pb.MessageType_MsgHeartbeat, From: r.id, To: id, Term: r.Term})
+				r.sendHeartbeat(id)
 			}
 			r.heartbeatElapsed = 0
 		case pb.MessageType_MsgAppend:
@@ -356,10 +366,8 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgRequestVote:
 			r.handleVoteRequest(m)
-		case pb.MessageType_MsgHeartbeatResponse:
 		case pb.MessageType_MsgPropose:
 		}
-		// 接收心跳
 	}
 	return nil
 }
@@ -434,7 +442,9 @@ func (r *Raft) broadcastAppend() {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	// r.msgs = append(r.msgs, m)
+	for _, entry := range m.GetEntries() {
+		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	}
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -443,6 +453,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, m.From)
 	}
+	r.sendHeartbeatResp(m.From)
 }
 
 // handleSnapshot handle Snapshot RPC request
