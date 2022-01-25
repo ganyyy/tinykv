@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -110,6 +111,16 @@ type Progress struct {
 	Match, Next uint64
 }
 
+func (p *Progress) MaybeUpdate(n uint64) bool {
+	var update bool
+	if p.Match < n {
+		p.Match = n
+		update = true
+	}
+	p.Next = max(p.Next, n+1)
+	return update
+}
+
 type Raft struct {
 	id uint64
 
@@ -198,27 +209,37 @@ func newRaft(c *Config) *Raft {
 
 func (r *Raft) send(msg pb.Message) {
 	//TODO 添加其他规则
+	msg.From = r.id
+	msg.Term = r.Term
 	r.msgs = append(r.msgs, msg)
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
-	var pr, ok = r.Prs[to]
-	if !ok {
+	var pr = r.Prs[to]
+	if pr == nil {
 		return false
 	}
-	//TODO 日志复制的条件?
-	var send = r.RaftLog.committed >= pr.Next
-	if send {
-		r.send(pb.Message{MsgType: pb.MessageType_MsgAppend})
+	var term, _ = r.RaftLog.Term(pr.Next - 1)
+	var entries = r.RaftLog.entriesSlice(pr.Next)
+
+	if len(entries) == 0 {
+		return false
 	}
-	return send
-}
 
-func (r *Raft) sendAppendResp() {
-
+	var msg pb.Message
+	msg.To = to
+	msg.MsgType = pb.MessageType_MsgAppend
+	msg.Index = pr.Next - 1
+	msg.LogTerm = term
+	msg.Commit = r.RaftLog.committed
+	msg.Entries = make([]*pb.Entry, len(entries))
+	for i, e := range entries {
+		msg.Entries[i] = &e
+	}
+	r.send(msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -291,7 +312,17 @@ func (r *Raft) becomeLeader() {
 	r.reset(r.Term)
 	r.State = StateLeader
 	r.Lead = r.id
-	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose})
+
+	for id := range r.Prs {
+		r.Prs[id].Next = r.RaftLog.LastIndex() + 1
+	}
+
+	r.Step(pb.Message{
+		From:    r.id,
+		To:      r.id,
+		MsgType: pb.MessageType_MsgPropose,
+		Entries: []*pb.Entry{{}},
+	})
 }
 
 func (r *Raft) reset(term uint64) {
@@ -364,9 +395,12 @@ func (r *Raft) Step(m pb.Message) error {
 				r.becomeFollower(m.Term, m.From)
 				r.handleAppendEntries(m)
 			}
+		case pb.MessageType_MsgAppendResponse:
+			r.handleAppendResponse(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleVoteRequest(m)
 		case pb.MessageType_MsgPropose:
+			r.handlePropose(m)
 		}
 	}
 	return nil
@@ -388,6 +422,76 @@ func (r *Raft) requestElection() {
 			Term:    r.Term,
 		})
 	}
+}
+
+func (r *Raft) handleAppendResponse(m pb.Message) {
+	if m.MsgType != pb.MessageType_MsgAppendResponse {
+		return
+	}
+
+	var pr = r.Prs[m.From]
+	if pr == nil {
+		return
+	}
+
+	if m.Reject {
+
+		return
+	}
+
+	if pr.MaybeUpdate(m.Index) {
+		if r.maybeCommit() {
+			r.broadcastAppend()
+		}
+	}
+}
+
+func (r *Raft) handlePropose(m pb.Message) {
+	if r.Prs[m.From] == nil {
+		return
+	}
+
+	var entries = make([]pb.Entry, len(m.Entries))
+	for i, e := range m.Entries {
+		entries[i] = *e
+	}
+	r.appendEntry(entries...)
+	r.maybeCommit()
+	r.broadcastAppend()
+}
+
+func (r *Raft) appendEntry(es ...pb.Entry) {
+	var li = r.RaftLog.LastIndex()
+	for i := range es {
+		es[i].Term = r.Term
+		es[i].Index = li + 1 + uint64(i)
+	}
+	li = r.RaftLog.appendEntries(es)
+	r.Prs[r.id].MaybeUpdate(li)
+}
+
+func (r *Raft) committed() (uint64, bool) {
+	var ln = len(r.Prs)
+	if ln == 0 {
+		return 0, false
+	}
+	var stack = make([]int, ln)
+	for id, pr := range r.Prs {
+		stack[int(id)-1] = int(pr.Match)
+	}
+	sort.Ints(stack)
+	// 排序后, 取较多的值作为commit的最终结果
+	var mid = ln - (ln / 2) - 1
+	return uint64(stack[mid]), true
+}
+
+func (r *Raft) maybeCommit() bool {
+	var commit, ok = r.committed()
+	if !ok {
+		return false
+	}
+	r.RaftLog.commitTo(commit)
+	return true
 }
 
 func (r *Raft) handleVoteRequest(m pb.Message) {
@@ -430,21 +534,27 @@ func (r *Raft) broadcastAppend() {
 		if id == r.id {
 			continue
 		}
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgAppend,
-			To:      id,
-			From:    r.id,
-			Term:    r.Term,
-		})
+		r.sendAppend(id)
 	}
 }
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	for _, entry := range m.GetEntries() {
-		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	if m.Index < r.RaftLog.committed {
+		r.send(pb.Message{
+			To:      m.From,
+			MsgType: pb.MessageType_MsgAppendResponse,
+			Index:   r.RaftLog.committed,
+		})
+		return
 	}
+
+	var entries = make([]pb.Entry, len(m.Entries))
+	for i, e := range m.Entries {
+		entries[i] = *e
+	}
+	r.appendEntry(entries...)
 }
 
 // handleHeartbeat handle Heartbeat RPC request

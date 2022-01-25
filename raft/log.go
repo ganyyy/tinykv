@@ -108,15 +108,64 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	var idx, _ = l.storage.LastIndex()
+	var idx uint64
+	if len(l.entries) == 0 {
+		idx, _ = l.storage.LastIndex()
+	} else {
+		idx = l.entries[len(l.entries)-1].Index
+	}
 	return idx
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	var term, err = l.storage.Term(i)
-	if err != nil {
-		return 0, err
+
+	var first, _ = l.storage.FirstIndex()
+	var last, _ = l.storage.LastIndex()
+	if i < first-1 {
+		return 0, ErrTermIndexNotfound
 	}
-	return term, nil
+	if i <= last {
+		var term, err = l.storage.Term(i)
+		if err != nil {
+			return 0, err
+		}
+		return term, nil
+	} else {
+		if i >= uint64(int(last)+len(l.entries)) {
+			return 0, ErrTermIndexNotfound
+		}
+		var entry = l.entries[i-last]
+		return entry.Index, nil
+	}
+
+}
+
+func (l *RaftLog) appendEntries(entries []pb.Entry) uint64 {
+	if len(entries) == 0 {
+		return l.LastIndex()
+	}
+	l.entries = append(l.entries, entries...)
+	return l.LastIndex()
+}
+
+func (l *RaftLog) commitTo(to uint64) {
+	if l.committed >= to {
+		return
+	}
+	if l.LastIndex() < to {
+		return
+	}
+	l.committed = to
+}
+
+func (l *RaftLog) entriesSlice(i uint64) []pb.Entry {
+	if i > l.LastIndex() {
+		return nil
+	}
+	var first, _ = l.storage.FirstIndex()
+	if i < first {
+		return nil
+	}
+	return l.entries[i-first:]
 }
