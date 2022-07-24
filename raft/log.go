@@ -15,8 +15,6 @@
 package raft
 
 import (
-	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -54,24 +52,36 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	firstIndex uint64
 }
-
-var ErrTermIndexNotfound = errors.New("request term entity not found")
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
+
+	var hardState, _, err = storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+
 	var lo, _ = storage.FirstIndex()
 	var hi, _ = storage.LastIndex() // 这个返回的是最后一个有效的Entity的索引
-	var hardState, _, _ = storage.InitialState()
-	var entries, _ = storage.Entries(lo, hi+1) // 注意看函数定义, 是一个左闭右开的区间
+
+	var entities []pb.Entry
+	if lo <= hi {
+		entities, err = storage.Entries(lo, hi+1)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	return &RaftLog{
-		storage:   storage,
-		committed: hardState.Commit,
-		applied:   lo - 1,
-		stabled:   hi,
-		entries:   entries,
+		storage:    storage,
+		committed:  hardState.Commit,
+		applied:    lo - 1,
+		stabled:    hi,
+		entries:    entities,
+		firstIndex: lo,
 	}
 }
 
@@ -95,7 +105,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	if l.committed > l.applied {
+	if l.applied > l.committed {
 		return nil
 	}
 	var first, _ = l.storage.FirstIndex()
@@ -110,7 +120,13 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	var idx uint64
 	if len(l.entries) == 0 {
-		idx, _ = l.storage.LastIndex()
+		// buf, why?
+		// RaftLog.entries来自于Storage中的[lo, hi]数据,
+		// 如果为空, 那么就等同于有效索引从 FirstIndex 开始(?)
+		// storage 的 ents长度不可能为0, 只有在
+		idx, _ = l.storage.FirstIndex()
+		// -1 是因为底层返回的是一个+1的数(???)
+		idx -= 1
 	} else {
 		idx = l.entries[len(l.entries)-1].Index
 	}
@@ -119,26 +135,14 @@ func (l *RaftLog) LastIndex() uint64 {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-
-	var first, _ = l.storage.FirstIndex()
-	var last, _ = l.storage.LastIndex()
-	if i < first-1 {
-		return 0, ErrTermIndexNotfound
-	}
-	if i <= last {
-		var term, err = l.storage.Term(i)
-		if err != nil {
-			return 0, err
+	// 先从有效的集合中获取
+	if len(l.entries) > 0 && i >= l.firstIndex {
+		if i > l.LastIndex() {
+			return 0, ErrUnavailable
 		}
-		return term, nil
-	} else {
-		if i >= uint64(int(last)+len(l.entries)) {
-			return 0, ErrTermIndexNotfound
-		}
-		var entry = l.entries[i-last]
-		return entry.Index, nil
+		return l.entries[i-l.firstIndex].GetTerm(), nil
 	}
-
+	return l.storage.Term(i)
 }
 
 func (l *RaftLog) appendEntries(entries []pb.Entry) uint64 {
@@ -149,14 +153,15 @@ func (l *RaftLog) appendEntries(entries []pb.Entry) uint64 {
 	return l.LastIndex()
 }
 
-func (l *RaftLog) commitTo(to uint64) {
+func (l *RaftLog) commitTo(to uint64) bool {
 	if l.committed >= to {
-		return
+		return false
 	}
 	if l.LastIndex() < to {
-		return
+		return false
 	}
 	l.committed = to
+	return true
 }
 
 func (l *RaftLog) entriesSlice(i uint64) []pb.Entry {
@@ -168,4 +173,24 @@ func (l *RaftLog) entriesSlice(i uint64) []pb.Entry {
 		return nil
 	}
 	return l.entries[i-first:]
+}
+
+func (l *RaftLog) Entries(lo, hi uint64) []pb.Entry {
+	if lo >= l.firstIndex && hi-lo <= uint64(len(l.entries)) {
+		return l.entries[lo-l.firstIndex : hi-l.firstIndex]
+	}
+	ent, _ := l.storage.Entries(lo, hi)
+	return ent
+}
+
+func (l *RaftLog) RemoveEntriesAfter(lo uint64) {
+	// 移除从lo 开始的所有日志
+	// 先看已存储的部分
+	l.stabled = min(l.stabled, lo-1)
+
+	// 处理未 **压缩的条目**
+	if lo-l.firstIndex >= uint64(len(l.entries)) {
+		return
+	}
+	l.entries = l.entries[:lo-l.firstIndex]
 }
