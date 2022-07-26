@@ -17,7 +17,6 @@ package raft
 import (
 	"errors"
 	"math/rand"
-	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -207,8 +206,11 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+func (r *Raft) half() int {
+	return len(r.Prs)/2 + 1
+}
+
 func (r *Raft) send(msg pb.Message) {
-	//TODO 添加其他规则
 	msg.From = r.id
 	msg.Term = r.Term
 	r.msgs = append(r.msgs, msg)
@@ -227,7 +229,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 		//TODO
 		return false
 	}
-	// 要附加的Entries
+	// 要附加的Entries, 从 pr.Next 开始
 	var entries = r.RaftLog.entriesSlice(preLogIndex + 1)
 
 	var msg pb.Message
@@ -256,11 +258,16 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	})
 }
 
-func (r *Raft) sendHeartbeatResp(to uint64) {
+func (r *Raft) sendHeartbeatResp(to uint64, reject bool) {
+	var lastIdx = r.RaftLog.LastIndex()
+	var lastTerm, _ = r.RaftLog.Term(lastIdx)
 	r.send(pb.Message{
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
+		Reject:  reject,
+		Index:   lastIdx,
+		LogTerm: lastTerm,
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 	})
 }
@@ -286,7 +293,8 @@ func (r *Raft) tick() {
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	if r.Term == term && r.Lead == lead {
+	if r.Term == term && r.Lead == lead && lead != None {
+		// 如果Leader是None, 也需要重置
 		return
 	}
 	r.reset(term)
@@ -383,7 +391,8 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgRequestVote:
 			r.handleVoteRequest(m)
 		case pb.MessageType_MsgHeartbeat:
-			r.handleHeartbeat(m)
+			// 候选节点不应该处理心跳
+			// 	r.handleHeartbeat(m)
 		}
 	case StateLeader:
 		switch m.GetMsgType() {
@@ -406,6 +415,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleVoteRequest(m)
 		case pb.MessageType_MsgPropose:
 			r.handlePropose(m)
+		case pb.MessageType_MsgHeartbeatResponse:
+			r.handleHeartbeatResponse(m)
 		}
 	}
 	return nil
@@ -416,6 +427,9 @@ func (r *Raft) requestElection() {
 		return
 	}
 	r.becomeCandidate()
+	// 选举时, 应该发送最后一个日志的Log和Term
+	var lastIdx = r.RaftLog.LastIndex()
+	var lastTerm, _ = r.RaftLog.Term(lastIdx)
 	for id := range r.Prs {
 		if id == r.id {
 			continue
@@ -425,15 +439,13 @@ func (r *Raft) requestElection() {
 			From:    r.id,
 			To:      id,
 			Term:    r.Term,
+			LogTerm: lastTerm,
+			Index:   lastIdx,
 		})
 	}
 }
 
 func (r *Raft) handleAppendResponse(m pb.Message) {
-	if m.MsgType != pb.MessageType_MsgAppendResponse {
-		return
-	}
-
 	var pr = r.Prs[m.From]
 	if pr == nil {
 		return
@@ -441,6 +453,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 
 	if m.Reject {
 		// 当前不匹配, 减一继续尝试匹配
+		// TODO 存在一定的优化空间
 		pr.Next -= 1
 		r.sendAppend(m.From)
 		return
@@ -478,18 +491,31 @@ func (r *Raft) appendEntry(es ...pb.Entry) {
 }
 
 func (r *Raft) committed() (uint64, bool) {
-	var ln = len(r.Prs)
-	if ln == 0 {
-		return 0, false
+	var canCommit bool
+	var committed = r.RaftLog.committed
+	var half = r.half() //(?)
+	for i := committed + 1; i <= r.RaftLog.LastIndex(); i++ {
+		// 任期不同的直接跳过去
+		term, _ := r.RaftLog.Term(i)
+		if term != r.Term {
+			continue
+		}
+		// 任期相同看当前匹配的节点个数
+		var cnt int
+		for _, p := range r.Prs {
+			if p.Match >= i {
+				cnt += 1
+			}
+		}
+		if cnt < half {
+			// 不满足条件直接pass
+			continue
+		}
+
+		committed = i
+		canCommit = true
 	}
-	var stack = make([]int, ln)
-	for id, pr := range r.Prs {
-		stack[int(id)-1] = int(pr.Match)
-	}
-	sort.Ints(stack)
-	// 排序后, 取较多的值作为commit的最终结果
-	var mid = ln - (ln / 2) - 1
-	return uint64(stack[mid]), true
+	return committed, canCommit
 }
 
 func (r *Raft) maybeCommit() bool {
@@ -501,16 +527,44 @@ func (r *Raft) maybeCommit() bool {
 }
 
 func (r *Raft) handleVoteRequest(m pb.Message) {
+	// 看主Term
+	if r.Term > m.Term {
+		r.sendVoteResponse(m.From, true)
+		return
+	}
+
+	// 重点是观察最后一条提交的日志!
+	// lastIndex := r.RaftLog.LastIndex()
+	// lastTerm, _ := r.RaftLog.Term(lastIndex)
+
+	if r.isMoreUpToDateThan(m.LogTerm, m.Index) {
+		// 注意: 这个函数返回true表示的时当前节点的数据比Message的数据还要新!
+		if r.Term < m.Term {
+			// 更新自己的周期
+			r.becomeFollower(m.Term, None)
+		}
+		r.sendVoteResponse(m.From, true)
+		return
+	}
+
 	if r.Term < m.Term {
+		// 较新的投票周期, 直接通过
+		// 投票并不意味着出现了Leader. 需要后续观察. 所以此时的Leader是None
 		r.becomeFollower(m.Term, None)
-	}
-	var reject bool
-	if r.Vote != None && r.Vote != m.From {
-		reject = true
-	} else {
 		r.Vote = m.From
+		r.sendVoteResponse(m.From, false)
+		return
 	}
-	r.send(pb.Message{From: r.id, Term: r.Term, To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: reject})
+
+	if r.Vote == m.From {
+		r.sendVoteResponse(m.From, false)
+		return
+	} else if r.Vote != None {
+		r.sendVoteResponse(m.From, true)
+		return
+	}
+
+	r.sendVoteResponse(m.From, false)
 }
 
 func (r *Raft) handleVoteResponse(m pb.Message) {
@@ -531,15 +585,22 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 	r.votes[m.From] = !m.Reject
 
 	var cnt int
+	var not int
 	for _, vote := range r.votes {
 		if vote {
 			cnt++
+		} else {
+			not++
 		}
 	}
 
-	if cnt >= len(r.Prs)/2+1 {
+	var half = r.half()
+
+	if cnt >= half {
 		r.becomeLeader()
 		r.broadcastAppend()
+	} else if not >= half {
+		r.becomeFollower(r.Term, None)
 	}
 }
 
@@ -598,19 +659,80 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 
 	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.committed = m.Commit
+		//But why? 文档这么说的, 别问我
+		var lastEntryIndex = m.Index
+		if len(m.Entries) > 0 {
+			lastEntryIndex = m.Entries[len(m.Entries)-1].Index
+		}
+		r.RaftLog.committed = min(m.Commit, lastEntryIndex)
 	}
 
 	r.sendAppendResponse(m.From, false)
 }
 
+func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, None)
+		return
+	}
+	// Leader 在接收到Follower的心跳回复时, 需要判断是否要附加日志到Follower上
+	if r.isMoreUpToDateThan(m.LogTerm, m.Index) {
+		r.sendAppend(m.From)
+	}
+}
+
+func (r *Raft) isMoreUpToDateThan(logTerm, logIndex uint64) bool {
+	var lastIndex = r.RaftLog.LastIndex()
+	var lastTerm, _ = r.RaftLog.Term(lastIndex)
+	// 日志的周期小于当前周期, 或者相同的情况下, 当前Index > 日志的Index
+	return logTerm < lastTerm || (logTerm == lastTerm && lastIndex > logIndex)
+}
+
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
+	if m.Term >= r.Term {
+	} else {
+		// 小于当前Term的无视即可
+		r.sendHeartbeatResp(m.From, true)
+		return
 	}
-	r.sendHeartbeatResp(m.From)
+	r.becomeFollower(m.Term, m.From)
+
+	// 对比Term
+	term, err := r.RaftLog.Term(m.Index)
+	if err != nil || term != m.LogTerm {
+		r.sendHeartbeatResp(m.From, true)
+		return
+	}
+
+	// 保留当前可达的Commit位置
+	if m.Commit > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, r.RaftLog.LastIndex())
+	}
+
+	r.sendHeartbeatResp(m.From, false)
+}
+
+func (r *Raft) sendAppendResponse(to uint64, reject bool) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Reject:  reject,
+		Index:   r.RaftLog.LastIndex(),
+	})
+}
+
+func (r *Raft) sendVoteResponse(to uint64, reject bool) {
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		From:    r.id,
+		Term:    r.Term,
+		To:      to,
+		Reject:  reject,
+	})
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -626,15 +748,4 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
-}
-
-func (r *Raft) sendAppendResponse(to uint64, reject bool) {
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		From:    r.id,
-		To:      to,
-		Term:    r.Term,
-		Reject:  reject,
-		Index:   r.RaftLog.LastIndex(),
-	})
 }
